@@ -1,0 +1,134 @@
+import duckdb
+import io
+import os
+from pathlib import Path
+import requests
+import tempfile
+import zipfile
+
+# -------------------------------------------------------------------------
+# Étape 1 : Récupérer l'URL du dernier export GDELT
+# -------------------------------------------------------------------------
+print("Récupération de la dernière URL GDELT...")
+last_update_resp = requests.get("http://data.gdeltproject.org/gdeltv2/lastupdate.txt")
+lines = last_update_resp.text.strip().split("\n")
+export_url = [line.split()[-1] for line in lines if "export.CSV.zip" in line][0]
+print(f"Archive ciblée : {export_url}")
+
+# -------------------------------------------------------------------------
+# Étape 2 : Connexion DuckDB (fichier local persistant)
+# -------------------------------------------------------------------------
+con = duckdb.connect("gdelt_analytics.duckdb")
+
+# Installation/chargement de l'extension HTTP pour lire directement les URLs distantes
+con.execute("INSTALL httpfs; LOAD httpfs;")
+
+# -------------------------------------------------------------------------
+# Étape 3 : Définition des colonnes officielles de GDELT 2.0
+# -------------------------------------------------------------------------
+gdelt_columns = [
+    # 0 à 4 : Identifiants & Date
+    "GlobalEventID", "Day", "MonthYear", "Year", "FractionDate",
+    
+    # 5 à 14 : Acteur 1 (Initiateur)
+    "Actor1Code", "Actor1Name", "Actor1CountryCode", "Actor1KnownGroupCode", 
+    "Actor1EthnicCode", "Actor1Religion1Code", "Actor1Religion2Code", 
+    "Actor1Type1Code", "Actor1Type2Code", "Actor1Type3Code",
+    
+    # 15 à 24 : Acteur 2 (Cible)
+    "Actor2Code", "Actor2Name", "Actor2CountryCode", "Actor2KnownGroupCode", 
+    "Actor2EthnicCode", "Actor2Religion1Code", "Actor2Religion2Code", 
+    "Actor2Type1Code", "Actor2Type2Code", "Actor2Type3Code",
+    
+    # 25 à 34 : Action (Nomenclature CAMEO & Évaluations)
+    "IsRootEvent", "EventCode", "EventBaseCode", "EventRootCode", 
+    "QuadClass", "GoldsteinScale", "NumMentions", "NumSources", 
+    "NumArticles", "AvgTone",
+    
+    # 35 à 42 : Géographie Acteur 1
+    "Actor1Geo_Type", "Actor1Geo_FullName", "Actor1Geo_CountryCode", 
+    "Actor1Geo_ADM1Code", "Actor1Geo_ADM2Code", "Actor1Geo_Lat", 
+    "Actor1Geo_Long", "Actor1Geo_FeatureID",
+    
+    # 43 à 50 : Géographie Acteur 2
+    "Actor2Geo_Type", "Actor2Geo_FullName", "Actor2Geo_CountryCode", 
+    "Actor2Geo_ADM1Code", "Actor2Geo_ADM2Code", "Actor2Geo_Lat", 
+    "Actor2Geo_Long", "Actor2Geo_FeatureID",
+    
+    # 51 à 58 : Géographie du lieu de l'Action & Méta
+    "ActionGeo_Type", "ActionGeo_FullName", "ActionGeo_CountryCode", 
+    "ActionGeo_ADM1Code", "ActionGeo_ADM2Code", "ActionGeo_Lat", 
+    "ActionGeo_Long", "ActionGeo_FeatureID",
+    
+    # 59 (Optionnel selon versions V2) : Date d'ajout et URL source
+    "DATEADDED", "SOURCEURL"
+]
+
+# -------------------------------------------------------------------------
+# Étape 4 : Chargement direct de la table de faits
+# -------------------------------------------------------------------------
+print("Téléchargement et création de la table de faits en cours...")
+col_names_str = ", ".join([f"'{c}'" for c in gdelt_columns])
+
+archive_resp = requests.get(export_url)
+archive_resp.raise_for_status()
+
+with zipfile.ZipFile(io.BytesIO(archive_resp.content)) as archive:
+    csv_members = [name for name in archive.namelist() if name.endswith(".CSV")]
+    if len(csv_members) != 1:
+        raise RuntimeError(f"Archive GDELT inattendue: {csv_members}")
+
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as csv_file:
+        csv_file.write(archive.read(csv_members[0]))
+        csv_path = csv_file.name
+
+try:
+    con.execute(f"""
+        CREATE OR REPLACE TABLE fact_gdelt_events AS
+        SELECT *
+        FROM read_csv(
+            '{csv_path}',
+            delim='\t',
+            header=False,
+            names=[{col_names_str}],
+            all_varchar=True
+        );
+    """)
+finally:
+    os.remove(csv_path)
+
+count_facts = con.execute("SELECT COUNT(*) FROM fact_gdelt_events").fetchone()[0]
+print(f"Lignes de faits créées : {count_facts}")
+
+# -------------------------------------------------------------------------
+# Étape 5 : Création des tables dimensionnelles et de faits
+# -------------------------------------------------------------------------
+cameo_path = Path("CAMEO.eventcodes.txt").resolve().as_posix()
+
+con.execute(f"""
+    CREATE OR REPLACE TABLE dim_event_codes AS
+    SELECT
+        CAMEOEVENTCODE AS EventCode,
+        EVENTDESCRIPTION AS EventDescription
+    FROM read_csv(
+        '{cameo_path}',
+        delim='\t',
+        header=True,
+        columns={{
+            'CAMEOEVENTCODE': 'VARCHAR',
+            'EVENTDESCRIPTION': 'VARCHAR'
+        }}
+    );
+""")
+
+count_codes = con.execute("SELECT COUNT(*) FROM dim_event_codes").fetchone()[0]
+count_unmatched = con.execute("""
+    SELECT COUNT(*)
+    FROM fact_gdelt_events AS fact
+    LEFT JOIN dim_event_codes AS dim USING (EventCode)
+    WHERE dim.EventCode IS NULL
+      AND fact.EventCode IS NOT NULL
+""").fetchone()[0]
+
+print(f"Codes CAMEO chargés : {count_codes}")
+print(f"Codes d'événements sans correspondance : {count_unmatched}")
