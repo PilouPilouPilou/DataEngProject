@@ -129,3 +129,50 @@ count_unmatched = con.execute("""
 
 print(f"Codes CAMEO chargés : {count_codes}")
 print(f"Codes d'événements sans correspondance : {count_unmatched}")
+
+country_path = Path("CAMEO.country.txt").resolve().as_posix()
+con.execute(f"""
+    CREATE OR REPLACE TABLE dim_countries AS
+    SELECT
+        CODE AS CountryCode,
+        LABEL AS CountryLabel
+    FROM read_csv(
+        '{country_path}',
+        delim='\t',
+        header=True,
+        columns={{
+            'CODE': 'VARCHAR',
+            'LABEL': 'VARCHAR'
+        }}
+    );
+""")
+
+country_count = con.execute("SELECT COUNT(*) FROM dim_countries").fetchone()[0]
+print(f"Pays CAMEO chargés : {country_count}")
+
+query = """
+SELECT
+    d.CountryLabel,
+    COUNT(*) AS nb_mentions
+FROM (
+    SELECT Actor1CountryCode AS CountryCode
+    FROM fact_gdelt_events
+    WHERE Actor1CountryCode IS NOT NULL
+      AND Actor1CountryCode <> ''
+
+    UNION ALL
+
+    SELECT Actor2CountryCode AS CountryCode
+    FROM fact_gdelt_events
+    WHERE Actor2CountryCode IS NOT NULL
+      AND Actor2CountryCode <> ''
+) t
+JOIN dim_countries d
+  ON d.CountryCode = t.CountryCode
+GROUP BY d.CountryCode, d.CountryLabel
+ORDER BY nb_mentions DESC
+LIMIT 5;
+"""
+
+result = con.execute(query).fetchdf()
+print(result)
