@@ -20,9 +20,6 @@ print(f"Archive ciblée : {export_url}")
 # -------------------------------------------------------------------------
 con = duckdb.connect("gdelt_analytics.duckdb")
 
-# Installation/chargement de l'extension HTTP pour lire directement les URLs distantes
-con.execute("INSTALL httpfs; LOAD httpfs;")
-
 # -------------------------------------------------------------------------
 # Étape 3 : Définition des colonnes officielles de GDELT 2.0
 # -------------------------------------------------------------------------
