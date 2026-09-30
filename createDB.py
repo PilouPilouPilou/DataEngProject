@@ -62,10 +62,17 @@ gdelt_columns = [
 ]
 
 # -------------------------------------------------------------------------
-# Étape 4 : Chargement direct de la table de faits
+# Étape 4 : Création du schéma de la table de faits puis chargement incrémental
 # -------------------------------------------------------------------------
-print("Téléchargement et création de la table de faits en cours...")
+print("Téléchargement et ajout des nouveaux événements GDELT en cours...")
 col_names_str = ", ".join([f"'{c}'" for c in gdelt_columns])
+column_defs_str = ", ".join([f"{c} VARCHAR" for c in gdelt_columns])
+
+con.execute(f"""
+    CREATE TABLE IF NOT EXISTS fact_gdelt_events (
+        {column_defs_str}
+    );
+""")
 
 archive_resp = requests.get(export_url)
 archive_resp.raise_for_status()
@@ -81,7 +88,7 @@ with zipfile.ZipFile(io.BytesIO(archive_resp.content)) as archive:
 
 try:
     con.execute(f"""
-        CREATE OR REPLACE TABLE fact_gdelt_events AS
+        INSERT INTO fact_gdelt_events
         SELECT *
         FROM read_csv(
             '{csv_path}',
@@ -89,13 +96,18 @@ try:
             header=False,
             names=[{col_names_str}],
             all_varchar=True
-        );
+        )
+        WHERE GlobalEventID IS NOT NULL
+          AND GlobalEventID NOT IN (
+              SELECT GlobalEventID
+              FROM fact_gdelt_events
+          );
     """)
 finally:
     os.remove(csv_path)
 
 count_facts = con.execute("SELECT COUNT(*) FROM fact_gdelt_events").fetchone()[0]
-print(f"Lignes de faits créées : {count_facts}")
+print(f"Lignes de faits présentes dans la table : {count_facts}")
 
 # -------------------------------------------------------------------------
 # Étape 5 : Création des tables dimensionnelles et de faits
@@ -174,5 +186,22 @@ ORDER BY nb_mentions DESC
 LIMIT 5;
 """
 
-result = con.execute(query).fetchdf()
-print(result)
+print(con.execute(query).fetchdf())
+
+
+query = """
+SELECT
+    d.EventCode,
+    d.EventDescription,
+    COUNT(*) AS nb_occurrences
+FROM fact_gdelt_events f
+JOIN dim_event_codes d
+  ON d.EventCode = f.EventCode
+WHERE f.EventCode IS NOT NULL
+  AND f.EventCode <> ''
+GROUP BY d.EventCode, d.EventDescription
+ORDER BY nb_occurrences DESC
+LIMIT 10;
+"""
+
+print(con.execute(query).fetchdf())
